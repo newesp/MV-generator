@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+librosa
+gradio_client==2.5.0
+pyyaml
+pillow
+ffmpeg-python
