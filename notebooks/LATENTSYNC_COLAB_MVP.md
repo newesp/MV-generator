@@ -6,6 +6,7 @@ This is the current working MVP path after the public Hugging Face and MuseTalk 
 outputs/gina_base_with_audio.mp4 + inputs/Cafe_no_Mar.mp3
   -> Colab LatentSync
   -> cropped main-face lip-sync MP4
+  -> optional 16:9 mouth-patch composite MP4
 ```
 
 The first successful validation was a 2 second clip using a main-face crop:
@@ -203,6 +204,159 @@ display(Video("/content/latentsync_gina_30s_mainface.mp4", embed=True, width=512
 files.download("/content/latentsync_gina_30s_mainface.mp4")
 ```
 
+## 30 Second Loop Fallback
+
+The direct 30 second crop can still fail with `RuntimeError: Face not detected` on some frames. If that happens, use the successful 2 second tight crop as a stable looped face source. This is not the final product approach, but it produces a complete 30 second lip-sync face layer for compositing tests.
+
+```python
+import os
+import subprocess
+
+sh = lambda s: subprocess.run(s, shell=True, check=True)
+sh("ffmpeg -y -stream_loop 20 -i /content/latentsync_video_2s_mainface.mp4 -t 30 -c:v libx264 -pix_fmt yuv420p /content/latentsync_video_30s_loop.mp4")
+sh("ffmpeg -y -i '/content/Cafe_no_Mar.mp3' -t 30 -ar 16000 -ac 1 /content/latentsync_audio_30s.wav")
+
+env = os.environ.copy()
+env["MPLBACKEND"] = "Agg"
+env["PYTHONUNBUFFERED"] = "1"
+
+python = "/content/conda/envs/latentsync/bin/python"
+args = (
+    "--unet_config_path configs/unet/stage2.yaml "
+    "--inference_ckpt_path checkpoints/latentsync_unet.pt "
+    "--inference_steps 10 "
+    "--guidance_scale 1.5 "
+    "--enable_deepcache "
+    "--video_path /content/latentsync_video_30s_loop.mp4 "
+    "--audio_path /content/latentsync_audio_30s.wav "
+    "--video_out_path /content/latentsync_gina_30s_loop_mvp.mp4"
+).split()
+
+subprocess.run(
+    [python, "-m", "scripts.inference"] + args,
+    cwd="/content/LatentSync",
+    env=env,
+    check=True,
+)
+print("OK", os.path.getsize("/content/latentsync_gina_30s_loop_mvp.mp4"))
+```
+
+## 16:9 MV Composite MVP
+
+The product target is a 16:9 MV, not a cropped face video. The validated short-term route is:
+
+1. keep the original 16:9 base video as the master frame;
+2. run LatentSync on the stable face crop;
+3. paste only a small soft mouth/lower-face patch back into the master frame; and
+4. mux the original song audio into the final MP4.
+
+Do not paste the full 320x320 face crop back into the 16:9 frame. That replaces hair, clothing, and background and creates a visible rectangular artifact.
+
+The first low-position mouth mask was visually clean but too transparent, so it looked almost identical to the original video. Raising opacity without color correction creates a yellow/bright patch because the LatentSync face crop does not match the 16:9 base frame's color. The next candidate should use a narrower mouth mask plus per-frame color matching before blending:
+
+```text
+mask center: cx=160, cy=242
+mask radius: rx=58, ry=24
+alpha scale: 1.25
+color match: patch mean/std -> base ROI mean/std inside the active mask
+```
+
+Reference Colab output name for this candidate:
+
+```text
+/content/gina_latentsync_16x9_mouth_cc125_mvp.mp4
+```
+
+The earlier low-position mouth-mask prototype used:
+
+```python
+import os
+import subprocess
+import cv2
+import numpy as np
+
+base = "/content/gina_base_with_audio.mp4"
+face = "/content/latentsync_gina_30s_loop_mvp.mp4"
+audio = "/content/Cafe_no_Mar.mp3"
+base30 = "/content/gina_base30_silent.mp4"
+silent = "/content/gina_latentsync_16x9_mouth_low_silent.mp4"
+out = "/content/gina_latentsync_16x9_mouth_low_mvp.mp4"
+preview = "/content/gina_latentsync_16x9_mouth_low_preview_15s.jpg"
+
+subprocess.run([
+    "ffmpeg", "-y", "-stream_loop", "1", "-i", base, "-t", "30",
+    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", base30,
+], check=True)
+
+B = cv2.VideoCapture(base30)
+F = cv2.VideoCapture(face)
+fps = B.get(cv2.CAP_PROP_FPS) or 24
+ffps = F.get(cv2.CAP_PROP_FPS) or fps
+W = int(B.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(B.get(cv2.CAP_PROP_FRAME_HEIGHT))
+N = int(round(30 * fps))
+
+x, y, w, h = 480, 20, 320, 320
+O = cv2.VideoWriter(silent, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+
+yy, xx = np.mgrid[0:h, 0:w]
+cx, cy, rx, ry = 160, 235, 68, 34
+d = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
+alpha = np.clip(1 - d, 0, 1) ** 1.5
+alpha = cv2.GaussianBlur(alpha.astype(np.float32), (0, 0), 11)[:, :, None] * 0.75
+
+last = None
+saved = False
+for i in range(N):
+    ok, frame = B.read()
+    if not ok:
+        break
+
+    F.set(cv2.CAP_PROP_POS_FRAMES, int(round((i / fps) * ffps)))
+    ok2, patch = F.read()
+    if not ok2:
+        patch = last
+    if patch is None:
+        break
+    last = patch
+
+    patch = cv2.resize(patch, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+    roi = frame[y:y + h, x:x + w].astype(np.float32)
+    frame[y:y + h, x:x + w] = np.clip(patch * alpha + roi * (1 - alpha), 0, 255).astype(np.uint8)
+
+    if (not saved) and i >= int(15 * fps):
+        cv2.imwrite(preview, frame)
+        saved = True
+    O.write(frame)
+
+B.release()
+F.release()
+O.release()
+
+subprocess.run([
+    "ffmpeg", "-y", "-i", silent, "-i", audio, "-t", "30",
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-shortest", out,
+], check=True)
+
+print("OK", os.path.getsize(out), out)
+print("PREVIEW", preview, os.path.getsize(preview))
+```
+
+Preview and download:
+
+```python
+from IPython.display import Image, Video, display
+from google.colab import files
+
+img = "/content/gina_latentsync_16x9_mouth_low_preview_15s.jpg"
+vid = "/content/gina_latentsync_16x9_mouth_low_mvp.mp4"
+display(Image(img, width=640))
+display(Video(vid, embed=True, width=640))
+files.download(vid)
+```
+
 ## Known Issues
 
 - Free Colab GPU quota can disconnect or refuse new GPU backends.
@@ -210,10 +364,13 @@ files.download("/content/latentsync_gina_30s_mainface.mp4")
 - The current output is a cropped close-up MVP, not the final 16:9 MV composition.
 - The base video contains a top-left picture-in-picture face, which confused LatentSync until the main-face crop was applied.
 - If `matplotlib` reports a backend error, make sure inference uses `export MPLBACKEND=Agg`.
+- Full-face 16:9 paste-back creates a visible rectangular artifact. Use a small mouth/lower-face alpha patch instead.
+- The loop fallback is useful for product-composition testing, but it is not a final natural-motion solution.
 
 ## Next Product Step
 
-After generating the cropped 30 second MVP, either:
+After validating the 16:9 mouth-patch MVP:
 
-1. paste the lip-synced face crop back into the original 16:9 base video, or
-2. regenerate the base video as a stable main-face close-up without the picture-in-picture overlay.
+1. replace the fixed mouth mask with face-landmark alignment;
+2. regenerate the base video without the picture-in-picture overlay; or
+3. run LatentSync on a product-grade stable close-up and composite it into the 16:9 MV.

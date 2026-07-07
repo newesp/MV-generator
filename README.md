@@ -65,6 +65,21 @@ The first successful smoke test used a 2 second cropped main-face clip:
 ```text
 crop=320:320:480:20,scale=512:512
 ```
+
+## Dynamic Mouth Tracking MVP
+
+The fixed-coordinate 16:9 mouth patch is not reliable for multi-shot MV footage.
+The next experiment tracks mouth landmarks per frame and dynamically composites
+the LatentSync mouth patch back into the base video.
+
+See [notebooks/DYNAMIC_MOUTH_TRACKING_MVP.md](notebooks/DYNAMIC_MOUTH_TRACKING_MVP.md).
+
+Local geometry tests:
+
+```powershell
+backend\venv\Scripts\python.exe -m unittest tests.test_mouth_tracking -v
+```
+
 - Fal.ai video generation is not wired in yet.
 - The default segmentation mode is `sections` to keep runtime and API usage predictable.
 - The app currently supports a single local generation job at a time.
